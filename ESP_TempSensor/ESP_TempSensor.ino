@@ -22,6 +22,15 @@ const long NTP_UPDATE_INTERVAL_MS = 600000; // 10 minutes in ms
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", UTC_OFFSET_SECONDS, NTP_UPDATE_INTERVAL_MS);
 
+// Immediate values, min and max.
+float min_temp = 50.0;
+float max_temp = 0.0;
+float current_temp = 0.0;
+
+// Temps to turn the relay on and off at.
+float relay_on_below_temp = 21.5;
+float relay_off_above_temp = 23.0;
+
 // Hourly values
 int hourly_average_counts[24];
 float hourly_average_temps[24];
@@ -48,6 +57,11 @@ void initHourlyValues() {
   }
 }
 
+void resetMinMaxTemps() {
+  min_temp = 50.0;
+  max_temp = 0.0;
+}
+
 void setupSerial() {
   Serial.begin(115200);
   Serial.println();
@@ -70,6 +84,7 @@ void setupWifi() {
 
 void setupWebServer() {
   server.on("/", handleRoot);               // Call the 'handleRoot' function when a client requests URI "/"
+  server.on("/reset", handleReset);         // Clear values and redirect back to root if "/reset" is requested
   server.onNotFound(handleNotFound);        // When a client requests an unknown URI (i.e. something other than "/"), call function "handleNotFound"
 
   server.begin();                           // Actually start the server
@@ -93,9 +108,6 @@ void setupRelay() {
   digitalWrite(RELAY_OUTPUT, LOW);
 }
 
-float min_temp = 50.0;
-float max_temp = 0.0;
-float current_temp = 0.0;
 int current_hour = 0;
 bool inStartup = true;
 
@@ -117,11 +129,11 @@ void loop() {
     }
     readTemperature();
 
-    if(current_temp < 20.5) {
+    if(current_temp < relay_on_below_temp) {
       digitalWrite(RELAY_OUTPUT, HIGH);
     }
 
-    if(current_temp > 24) {
+    if(current_temp > relay_off_above_temp) {
       digitalWrite(RELAY_OUTPUT, LOW);
     }
     loopCount = 0;
@@ -196,6 +208,13 @@ void readTemperature() {
   Serial.println(timeClient.getFormattedTime());
 }
 
+String getLineBreak(bool inHtml) {
+  if(inHtml)
+    return "<br>";
+  else
+    return "\n";
+}
+
 String getTempReport() {
   char current_temp_str[6];
   char min_temp_str[6];
@@ -213,13 +232,19 @@ String getTempReport() {
   return report;
 }
 
-String getAveragesReport() {
-  String report = "Hour    Average (deg C)\n-----------------------\n";
-  int hour = 0;
+String getAveragesReport(int startAtHour, bool inHtml) {
+  String report = "Hour    Average (deg C)";
+  report = report + getLineBreak(inHtml);
+  report = report + "-----------------------" + getLineBreak(inHtml);
+  int hour;
   char avg_temp_str[6];
-  for(hour = 0; hour < 24; hour++) {
+  for(hour = startAtHour; hour < 24; hour++) {
     dtostrf(hourly_average_temps[hour], 5, 1, avg_temp_str);
-    report = report + hour + ":00     " + avg_temp_str + "\n"; 
+    report = report + hour + ":00     " + avg_temp_str + getLineBreak(inHtml); 
+  }
+  for(hour = 0; hour < startAtHour; hour++) {
+    dtostrf(hourly_average_temps[hour], 5, 1, avg_temp_str);
+    report = report + hour + ":00     " + avg_temp_str + getLineBreak(inHtml); 
   }
   return report;
 }
@@ -239,12 +264,85 @@ float get_temperature() {
   return temp;
 }
 
+const char INDEX_HEADER[] =
+"<!DOCTYPE HTML>"
+"<html>"
+"<head>"
+"<meta name = \"viewport\" content = \"width = device-width, initial-scale = 1.0, maximum-scale = 1.0, user-scalable=0\">"
+"<title>Beer Brew Monitor</title>"
+"<style>"
+"\"body { background-color: #808080; font-family: Arial, Helvetica, Sans-Serif; Color: #000000; }\""
+"</style>"
+"</head>"
+"<body><h1>Beer Brew Monitor</h1>";
+
+const char INDEX_FOOTER[] = 
+"</body>"
+"</html>";
+
+String prepareSetPointForm() {
+  char min_temp_str[6];
+  char max_temp_str[6];
+  dtostrf(relay_on_below_temp, 5, 1, min_temp_str);
+  dtostrf(relay_off_above_temp, 5, 1, max_temp_str);
+  
+  String formContent = "<form action=\"/\" method=\"post\">"
+    "<label for=\"minset\">Heater on below:</label>"
+    "<input type=\"text\" id=\"minset\" name=\"minset\" value=\"";
+  formContent = formContent + min_temp_str;
+  formContent = formContent + "\"><br>";
+  formContent = formContent + "<label for=\"maxset\">Heater off above:</label>" +
+    "<input type=\"text\" id=\"maxset\" name=\"maxset\" value=\"";
+  formContent = formContent + relay_off_above_temp;
+  formContent = formContent + "\"><br>";
+  formContent = formContent + "<input type=\"submit\" value=\"Set\"></form>";
+  return formContent;
+}
+
+String prepareResetTempForm() {
+  String formContent = "<form action=\"/\" method=\"post\">"
+  "<input type=\"submit\" name=\"resetminmax\" value=\"Reset min and max\">"
+  "</form>";
+  return formContent;
+}
+
 void handleRoot() {
-  String response;
-  response = "Time: " + timeClient.getFormattedTime() + "\n";
-  response = response + getTempReport() + "\n";
-  response = response + getAveragesReport();
-  server.send(200, "text/plain", response);   // Send HTTP status 200 (Ok) and send some text to the browser/client
+  if(server.hasArg("minset"))
+    handleSetPoints();
+
+  if(server.hasArg("resetminmax"))
+    handleReset();
+  
+  String response = INDEX_HEADER;
+  response = response + "<code>";
+  response = response + "Time: " + timeClient.getFormattedTime() + getLineBreak(true);
+  response = response + getTempReport() + getLineBreak(true);
+  int startAt = current_hour + 1;
+  if(startAt > 23) startAt = 0;
+  response = response + getAveragesReport(current_hour + 1, true);
+  response = response + "</code><p>";
+  response = response + prepareSetPointForm();
+  response = response + prepareResetTempForm();
+  response = response + INDEX_FOOTER;
+  server.send(200, "text/html", response);   // Send HTTP status 200 (Ok) and send some text to the browser/client
+}
+
+void handleReset() {
+  resetMinMaxTemps();
+  //server.sendHeader("Location", "/",true);   //Redirect to our html web page  
+  //server.send(302, "text/plain","");
+}
+
+void handleSetPoints() {
+  String minsetvalue = server.arg("minset");
+  String maxsetvalue = server.arg("maxset");
+  float fminsetvalue = minsetvalue.toFloat();
+  float fmaxsetvalue = maxsetvalue.toFloat();
+
+  if(minsetvalue < maxsetvalue) {
+    relay_on_below_temp = fminsetvalue;
+    relay_off_above_temp = fmaxsetvalue;
+  }
 }
 
 void handleNotFound() {
