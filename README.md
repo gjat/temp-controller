@@ -7,7 +7,8 @@ The current, min and max temperatures are displayed on a text web page served by
 ## TODO
 - Fix loading and saving of temperatures (dealing with power cycles).  Somehow the max value isn't loading
 - Nicer display (html)
-- Configuration for the WIFI network to connect to, without having to hard-code a network password.  I assume the device would need to start up as an access point, and let you configure it, then reset into "normal" mode.
+- More polish on configuring.  Timezone, network stuff, etc.
+- Tried mDNS, but didn't really work for me.
 - Some form of OTA update would be nice.
 
 ## Notes for programming / hardware
@@ -20,11 +21,15 @@ The current, min and max temperatures are displayed on a text web page served by
 
 TODO: Need a schematic / layout of both boards.
 
+Roughly based on https://tttapa.github.io/ESP8266/Chap02%20-%20Hardware.html
+
 ### Running board
-- Doesn't have reset / programming buttons
-- Uses a IRF7401 MOSFET as the relay driver (because I had them lying around)
-- Regulates 12v to 5v using a switching regulator module I had lying around (again)
-- Regulates the 5v to 3.3v using an LD1117 3.3v regulator.
+- Doesn't have reset / programming buttons.  Just adds the reset pullup.
+- Exposes an I2C header for plugging in the temp sensor (3.3v power, ground included)
+- Uses a IRF7401 MOSFET as the relay driver (because I had them lying around from fixing something else).  I used a 680 ohm resistor between GPIO 16 and the MOSFET's gate, for paranoid current protection for the ESP8266.   I also put a 10k resistor between the MOSFET's gate and ground (to in theory help turn off).  GPIO pins take some looking at on an ESP8266 board.  Get the right diagram.
+- Regulates 12v to 5v using a switching regulator module (again, stuff I had lying around)
+- Regulates the 5v to 3.3v using an LD1117 3.3v regulator.  The double regulator arrangement was because I wanted 12 volts for the relay, but didn't want to drop 12 - 3.3v = 8.7 volts over the LD1117, thinking it might get warm.
+- Relay is between the 12v supply and the drain of the mosfet.  Mosfet's source is tied to ground.
 - One day, I might add a second output to control "cooling" via the old fridge itself.  But for now, it's just heating.
 
 ## References
