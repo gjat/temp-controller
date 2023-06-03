@@ -1,6 +1,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
+#include <ArduinoOTA.h>
 #include <Wire.h>
 #include <WiFiUdp.h>
 // Library NTPClient
@@ -13,74 +14,110 @@
 
 #define WIFI_CONFIG_NAME "BrewBeerSensor"
 #define MDNS_NAME "BrewBeer"  // BrewBeer.local
+#define OTA_HOSTNAME MDNS_NAME
+#define OTA_PASSWORD MDNS_NAME "1"  
 
 // Because I'm in NZ, this is UTC+12 hours.  Change for your timezone
-//  one day, I'll make this a config option.
-const long UTC_OFFSET_SECONDS = 12 * 60 * 60;
-
-#define DS1621_ADDRESS_1 0x48  // All address pins connect to ground
-#define RELAY_OUTPUT 16        // (4th from top on left, on a "bare board").   
-#define SERIAL_PORT_BPS 115200
-
-// NTP update time.  Doesn't need to be often.
+//  Can be entered via the WifiManager.
+const long DEFAULT_TIMEZONE_OFFSET = 12;
+long timezone_offset = DEFAULT_TIMEZONE_OFFSET;
 const long NTP_UPDATE_INTERVAL_MS = 600000; // 10 minutes in ms
 
-// The file used to store previous data over a reboot
+
+const long SECONDS_PER_MINUTE = 60;
+const long SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE;
+const long SECONDS_PER_DAY = 24 * SECONDS_PER_HOUR;
+
+#define DS1621_ADDRESS_1 0x48  // All address pins connect to ground
+#define RELAY_OUTPUT 16        // ??
+#define SERIAL_PORT_BPS 115200
+
+// Files used to store previous data and config over a reboot
 #define DATA_FILE "/avgs.csv"
+#define CONFIG_FILE "/config.csv"
 
 ESP8266WebServer server(80);    // Create a webserver object that listens for HTTP request on port 80
 WiFiManager wifiManager;
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", UTC_OFFSET_SECONDS, NTP_UPDATE_INTERVAL_MS);
+NTPClient timeClient(ntpUDP, "pool.ntp.org");
 
 void handleRoot();              // function prototypes for HTTP handlers
+void handleJson();
 void handleNotFound();
 
 // Immediate values, min and max.
-float min_temp = 50.0;
-float max_temp = 0.0;
+const float MIN_ACCEPTED_TEMP = 0.0;
+const float MAX_ACCEPTED_TEMP = 100;
+float min_temp = MAX_ACCEPTED_TEMP;
+float max_temp = MIN_ACCEPTED_TEMP;
 float current_temp = 0.0;
 
 // Temps to turn the relay on and off at.
-float relay_on_below_temp = 21.5;
-float relay_off_above_temp = 23.0;
+const float DEFAULT_RELAY_ON_BELOW_TEMP = 22.0;
+const float DEFAULT_RELAY_OFF_ABOVE_TEMP = 23.0;
+float relay_on_below_temp = DEFAULT_RELAY_ON_BELOW_TEMP;
+float relay_off_above_temp = DEFAULT_RELAY_OFF_ABOVE_TEMP;
 
-// Hourly values
-int hourly_average_counts[24];
-float hourly_average_temps[24];
+// Sample configuration.  Samples per day (per hour, per half hour), determining
+//   minutes per sample.
+const int SAMPLES_PER_DAY = 48;
+const int MINUTES_PER_DAY = 24 * 60;
+const int MINUTES_PER_SAMPLE = MINUTES_PER_DAY / SAMPLES_PER_DAY;
+
+// Sample storage
+const int NUM_SAMPLES = SAMPLES_PER_DAY;
+int sample_average_counts[NUM_SAMPLES];
+float sample_average_temps[NUM_SAMPLES];
 
 // ----------------------------------------------------------------------
 
 void setup()
 {
-  initHourlyValues();
+  initSampleRecords();
   setupSerial();
-  wifiManager.setConfigPortalTimeout(300);  // 5 minutes for configuration
-  wifiManager.autoConnect(WIFI_CONFIG_NAME);
-  setupI2C();
-  setupRelay();
-  setupWebServer();
-  timeClient.begin();
-  if(!MDNS.begin(MDNS_NAME)) {
-    Serial.println("Failed to setup MDNS responder!");
-  }
   
   if(!LittleFS.begin()) {
-    Serial.println("Failed to start filesystem!");
+    Serial.println(F("Failed to start filesystem!"));
   }
+
+  readConfigFromFS();
+
+  setupI2C();
+  initialiseTempSensor();
+  setupRelay();
+  setupWifi();
+  setupWebServer();
+
+  // The wifi manager prompts for this.
+  timeClient.setTimeOffset(timezone_offset * SECONDS_PER_HOUR);
+  timeClient.setUpdateInterval(NTP_UPDATE_INTERVAL_MS);
+  timeClient.begin();
+
+  if(!MDNS.begin(MDNS_NAME)) {
+    Serial.println(F("Failed to setup MDNS responder!"));
+  }
+  
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.begin();
 }
 
-void initHourlyValues() {
-  int i;
-  for(i=0; i<24; i++) {
-    hourly_average_counts[i] = 0;
-    hourly_average_temps[i] = 0;
-  }
-}
-
-void resetMinMaxTemps() {
+void resetMinMaxTemps(bool saveChanges = false) {
   min_temp = 50.0;
   max_temp = 0.0;
+
+  if(saveChanges)
+    writeDataToFS();
+}
+
+void initSampleRecords() {
+  int i;
+  for(i=0; i<NUM_SAMPLES; i++) {
+    sample_average_counts[i] = 0;
+    sample_average_temps[i] = 0;
+  }
+
+  resetMinMaxTemps();
 }
 
 void setupSerial() {
@@ -88,8 +125,37 @@ void setupSerial() {
   Serial.println();
 }
 
+//flag for saving data
+bool wifiManagerConfigChanged = false;
+
+//callback notifying us of the need to save config
+void saveConfigCallback () {
+  wifiManagerConfigChanged = true;
+}
+
+void setupWifi() {
+  wifiManager.setConfigPortalTimeout(300);  // 5 minutes for configuration
+  
+  char str_tz_offset[6];
+  sprintf(str_tz_offset, "%d", timezone_offset);
+  WiFiManagerParameter timezoneParam("timezone_offset", "Timezone Offset", str_tz_offset, 3);
+  wifiManager.addParameter(&timezoneParam);
+  
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+  
+  wifiManager.autoConnect(WIFI_CONFIG_NAME);
+  
+  timezone_offset = atoi(timezoneParam.getValue());
+  if(timezone_offset < -12 || timezone_offset > 12)
+    timezone_offset = DEFAULT_TIMEZONE_OFFSET;
+  
+  if(wifiManagerConfigChanged)
+    writeConfigToFS();
+}
+
 void setupWebServer() {
   server.on("/", handleRoot);               // Call the 'handleRoot' function when a client requests URI "/"
+  server.on("/json", handleJson);
   server.onNotFound(handleNotFound);        // When a client requests an unknown URI (i.e. something other than "/"), call function "handleNotFound"
   server.begin();                           // Actually start the server
 }
@@ -97,6 +163,10 @@ void setupWebServer() {
 void setupI2C() {
   Wire.begin();
   Wire.setClock(400000);
+}
+
+void initialiseTempSensor() {
+  // Assumes setupI2C has been called
   Wire.beginTransmission(DS1621_ADDRESS_1);
   Wire.write(0xAC);                         // send configuration register address (Access Config)
   Wire.write(0);                            // perform continuous conversion
@@ -114,35 +184,34 @@ void setupRelay() {
 
 // ----------------------------------------------------------------------
 
-int current_hour = 0;
+int current_sample = 0;
 bool inStartup = true;
+unsigned long startup_time = 0;
 
 const int LOOP_DELAY = 1000;
 int loopCount = LOOP_DELAY;
 
 void loop() {
-  server.handleClient();                    // Listen for HTTP requests from clients
+  MDNS.update();                       // Some tutorials leave this out.  Ugh.
+  server.handleClient();               // Listen for HTTP requests from clients
+  ArduinoOTA.handle();
+  timeClient.update();
   
   delay(10);    
   
   loopCount++;
   if(loopCount > LOOP_DELAY)
   {
-    timeClient.update();
-
-    // Read any values stored in the filesystem, if this is the first time around.
-    if(inStartup) {
-      readFromFS();
-      inStartup = false;
-    }
-    readTemperature();
-
-    if(current_temp < relay_on_below_temp) {
-      digitalWrite(RELAY_OUTPUT, HIGH);
-    }
-
-    if(current_temp > relay_off_above_temp) {
-      digitalWrite(RELAY_OUTPUT, LOW);
+    if(timeClient.isTimeSet())
+    {
+      // Read any values stored in the filesystem, if this is the first time around.
+      if(inStartup) {
+        startup_time = timeClient.getEpochTime();
+        readDataFromFS();
+        inStartup = false;
+      }
+      readTemperature();
+      switchRelay();
     }
     loopCount = 0;
   }
@@ -156,41 +225,74 @@ void writeFloat(File file, float value) {
   file.print(",");
 }
 
-void writeToFS() {
+void writeInt(File file, int value) {
+  file.print(String(value));
+  file.print(",");
+}
+
+void readConfigFromFS() {
+  if(LittleFS.exists(CONFIG_FILE)) {
+    File file = LittleFS.open(CONFIG_FILE, "r");
+
+    // Read from file
+    timezone_offset = file.parseInt();
+    if(timezone_offset < -12 || timezone_offset > 12)
+      timezone_offset = DEFAULT_TIMEZONE_OFFSET;
+    file.close();
+  }
+}
+
+void writeConfigToFS() {
+  File file = LittleFS.open(CONFIG_FILE, "w");
+  writeInt(file, timezone_offset);
+  delay(1);
+  file.close();  
+}
+
+void writeDataToFS() {
 
   File file = LittleFS.open(DATA_FILE, "w");
-  
-  //Write to the file
-  file.print(String(current_temp,1));  file.print(",");
-  file.print(String(min_temp, 1)); file.print(",");
-  file.print(String(max_temp, 1)); file.print(",");
+  writeFloat(file, current_temp);
+  writeFloat(file, min_temp);
+  writeFloat(file, max_temp);
+  writeFloat(file, relay_on_below_temp);
+  writeFloat(file, relay_off_above_temp);
   
   int i = 0;
-  for(i = 0; i < 24; i++) {
-    writeFloat(file, hourly_average_temps[i]);
-    file.print(hourly_average_counts[i]);
-    file.print(",");
+  for(i = 0; i < NUM_SAMPLES; i++) {
+    writeFloat(file, sample_average_temps[i]);
+    writeInt(file, sample_average_counts[i]);
   }
-  
+
+  // Not sure why, but I think it helps the FS.
   delay(1);
 
   //Close the file
   file.close(); 
 }
 
-void readFromFS() {
+void readDataFromFS() {
   
   if(LittleFS.exists(DATA_FILE)) {
     File file = LittleFS.open(DATA_FILE, "r");
-
-    // Read from file
-    current_temp = file.parseFloat();
+    current_temp = file.parseFloat();  
     min_temp = file.parseFloat();
     max_temp = file.parseFloat();
+    relay_on_below_temp = file.parseFloat();
+    relay_off_above_temp = file.parseFloat();
+
+    // Sanity check these values, because the relay logic
+    //  wouldn't behave well if they were upside down.
+    if(relay_on_below_temp >= relay_off_above_temp)
+    {
+      relay_on_below_temp = DEFAULT_RELAY_ON_BELOW_TEMP;
+      relay_off_above_temp = DEFAULT_RELAY_OFF_ABOVE_TEMP;
+    }
+    
     int i = 0;
-    for(i = 0; i < 24; i++) {
-      hourly_average_temps[i] = file.parseFloat();
-      hourly_average_counts[i] = file.parseInt();
+    for(i = 0; i < NUM_SAMPLES; i++) {
+      sample_average_temps[i] = file.parseFloat();
+      sample_average_counts[i] = file.parseInt();
     }
     file.close();
   }
@@ -201,23 +303,40 @@ void readFromFS() {
 
 void readTemperature() {
 
-  current_temp = get_temperature();
-
-  if (current_temp < min_temp) min_temp = current_temp;
-  if (current_temp > max_temp) max_temp = current_temp;
-
-  int nowHour = timeClient.getHours();
-  if(nowHour != current_hour)
+  float now_temp = get_temperature();
+  if(now_temp < MIN_ACCEPTED_TEMP || now_temp > MAX_ACCEPTED_TEMP)
   {
-    current_hour = nowHour;
-    hourly_average_temps[nowHour] = current_temp;
-    hourly_average_counts[nowHour] = 1;
-    writeToFS();
+    Serial.println("Temp outside range.  Ignoring it.");
+    // Try and re-initialise the temp sensor.  Perhaps it has power-cycled, and needs to 
+    //  be told to start conversions again.
+    initialiseTempSensor();
+    return;
+  }
+  
+  current_temp = now_temp;
+
+  // Update min and max
+  if (current_temp < min_temp) 
+    min_temp = current_temp;
+
+  if (current_temp > max_temp) 
+    max_temp = current_temp;
+
+  // Calculate which sample timeslot we're in
+  int nowSample = (timeClient.getHours() * 60 + timeClient.getMinutes()) / MINUTES_PER_SAMPLE;
+  
+  // Update the sample record
+  if(nowSample != current_sample)
+  {
+    current_sample = nowSample;
+    sample_average_temps[nowSample] = current_temp;
+    sample_average_counts[nowSample] = 1;
+    writeDataToFS();
   }
   else
   {
-    hourly_average_temps[nowHour] = ((hourly_average_temps[nowHour] * hourly_average_counts[nowHour]) + current_temp) / (hourly_average_counts[nowHour] + 1);
-    hourly_average_counts[nowHour]++;
+    sample_average_temps[nowSample] = ((sample_average_temps[nowSample] * sample_average_counts[nowSample]) + current_temp) / (sample_average_counts[nowSample] + 1);
+    sample_average_counts[nowSample]++;
   }
 
   Serial.println(getTempReport());
@@ -239,108 +358,184 @@ float get_temperature() {
   return temp;
 }
 
+
+void switchRelay() {
+  if(current_temp < relay_on_below_temp) {
+    digitalWrite(RELAY_OUTPUT, HIGH);
+  }
+
+  if(current_temp > relay_off_above_temp) {
+    digitalWrite(RELAY_OUTPUT, LOW);
+  }
+}
+
+
 // ----------------------------------------------------------------------
 //  Make "reports"
-
-String getLineBreak(bool inHtml) {
-  if(inHtml)
-    return "<br>";
-  else
-    return "\n";
-}
-
 String getTempReport() {
-  String report = "Now = ";
-  report += String(current_temp, 1);
-  report += " deg C, Min = ";
-  report += String(min_temp, 1);
-  report += " deg C, Max = ";
-  report += String(max_temp, 1);
-  report += " deg C";
-  return report;
+  char tempBuf[20];
+  sprintf_P(tempBuf, PSTR("Now: %0.1f C,  Min: %0.1f C,  Max: %0.1f C"), current_temp, min_temp, max_temp);
+  return String(tempBuf);
 }
 
-String getAveragesReport(int startAtHour, bool inHtml) {
-  String report = "Hour    Average (deg C)";
-  report += getLineBreak(inHtml);
-  report += "-----------------------" + getLineBreak(inHtml);
-  
-  int hour;
-  for(hour = startAtHour; hour < 24; hour++) {
-    report += String(hour) + ":00     " + 
-      String(hourly_average_temps[hour], 1) + 
-      getLineBreak(inHtml); 
-  }
-  
-  for(hour = 0; hour < startAtHour; hour++) {
-    report += String(hour) + ":00     " + 
-      String(hourly_average_temps[hour], 1) + 
-      getLineBreak(inHtml); 
-  }
+String getTimeFromSampleIndex(int sampleIdx) {
+  int sample_time_minutes = sampleIdx * MINUTES_PER_SAMPLE;
+  char tempBuf[6];
+  sprintf(tempBuf, "%02d:%02d", sample_time_minutes / 60, sample_time_minutes % 60);
+  return String(tempBuf);
+}
 
-  return report;
+
+String getChart(int startAtSample) {
+  String labels;
+  String data_values;
+  int sample;
+  for(sample = startAtSample; sample < NUM_SAMPLES; sample++) {
+    if(sample > startAtSample) {
+      labels += ",";  data_values += ",";
+    }
+    labels += "\"" + getTimeFromSampleIndex(sample) + "\"";
+    data_values += String(sample_average_temps[sample], 1);
+  }
+  
+  for(sample = 0; sample < startAtSample; sample++) {
+    labels += ",\"" + getTimeFromSampleIndex(sample) + "\"";
+    data_values += "," + String(sample_average_temps[sample], 1);  
+  }
+  
+  String chartHtml = F("<div><canvas id=\"tempChart\" style=\"max-height=300px\"></canvas></div>"
+    "<script>const ctx = document.getElementById('tempChart');"
+    "new Chart(ctx, {"
+      "type: 'line',"
+      "data: {"
+       "labels: [");
+  chartHtml += labels;
+  chartHtml += F(
+       "],"
+       "datasets: [{"
+         "label: 'temperature (C)',"
+         "data: [");
+  chartHtml += data_values;
+  chartHtml += F(
+         "],"
+         "borderWidth: 1"
+       "}]"
+      "},"
+     "options: {"
+     " scales: {"
+      " y: { "
+         " beginAtZero: true, "
+         " max: 40"
+       " } "
+     " } "
+   " } "
+  " }); "
+  "</script>");
+  return chartHtml;
 }
 
 // ----------------------------------------------------------------------
 //  Web Server
 
-const char INDEX_HEADER[] =
+const char INDEX_HEADER[] PROGMEM = 
 "<!DOCTYPE HTML>"
 "<html>"
 "<head>"
 "<meta name = \"viewport\" content = \"width = device-width, initial-scale = 1.0, maximum-scale = 1.0, user-scalable=0\">"
 "<title>Beer Brew Monitor</title>"
 "<style>"
-"\"body { background-color: #808080; font-family: Arial, Helvetica, Sans-Serif; Color: #000000; }\""
+"body { font-family: Arial, Helvetica, Sans-Serif; Color: #000000; }"
 "</style>"
 "</head>"
-"<body><h1>Beer Brew Monitor</h1>";
+"<body><h1>Beer Brew Monitor</h1>"
+"<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>";  // May move this locally later
 
-const char INDEX_FOOTER[] = 
+const char INDEX_FOOTER[] PROGMEM = 
 "</body>"
 "</html>";
 
 String prepareSetPointForm() {
-  String formContent = "<form action=\"/\" method=\"post\">"
+  String formContent = F("<form action=\"/\" method=\"post\">"
     "<label for=\"minset\">Heater on below:</label>"
-    "<input type=\"text\" id=\"minset\" name=\"minset\" value=\"";
+    "<input type=\"text\" id=\"minset\" name=\"minset\" value=\"");
   formContent += String(relay_on_below_temp,1);
-  formContent += "\"><p>"
+  formContent += F("\" size=\"4\"><p>"
     "<label for=\"maxset\">Heater off above:</label>"
-    "<input type=\"text\" id=\"maxset\" name=\"maxset\" value=\"";
+    "<input type=\"text\" id=\"maxset\" name=\"maxset\" value=\"");
   formContent += String(relay_off_above_temp, 1);
-  formContent += "\"><p>"
-    "<input type=\"submit\" value=\"Set\"></form>";
+  formContent += F("\" size=\"4\"> "
+    "<input type=\"submit\" value=\"Set\"></form>");
   return formContent;
 }
 
-String prepareResetTempForm() {
-  String formContent = "<form action=\"/\" method=\"post\">"
-  "<input type=\"submit\" name=\"resetminmax\" value=\"Reset min and max\">"
-  "</form>";
+String prepareControlButtonsForm() {
+  String formContent = F("<form action=\"/\" method=\"post\">"
+  "<input type=\"submit\" name=\"resetminmax\" value=\"Reset min and max\"> "
+  "<input type=\"submit\" name=\"resetall\" value=\"Reset All Values\"> "
+  "<input type=\"submit\" name=\"resetwifi\" value=\"Reset Wifi\"> "
+  "</form>");
   return formContent;
+}
+
+String getUpTime() {
+  unsigned long uptime_total_seconds = timeClient.getEpochTime() - startup_time;
+  int days = uptime_total_seconds / 86400;
+  uptime_total_seconds -= days * 86400;
+  int hours = uptime_total_seconds / 3600;
+  uptime_total_seconds -= hours * 3600;
+  int minutes = uptime_total_seconds / 60;
+  uptime_total_seconds -= minutes * 60;
+
+  char tempBuf[20];
+  sprintf_P(tempBuf, PSTR("%d days %02d:%02d:%02d"), days, hours, minutes, uptime_total_seconds);
+  return String(tempBuf);
 }
 
 void handleRoot() {
-  if(server.hasArg("minset"))
+  if(server.hasArg("minset")) {
     handleSetPoints();
+    return redirectBackToRoot();
+  }
 
-  if(server.hasArg("resetminmax"))
-    resetMinMaxTemps();
+  if(server.hasArg("resetminmax")) {
+    resetMinMaxTemps(true);
+    return redirectBackToRoot();
+  }
+
+  if(server.hasArg("resetall")) {
+    handleResetAll();
+    return redirectBackToRoot();
+  }
+
+  if(server.hasArg("resetwifi")) {
+    wifiManager.erase();
+    ESP.restart();
+  }
   
-  String response = INDEX_HEADER;
-  response += "<code>";
+  String response = FPSTR(INDEX_HEADER);
   response += "Time: " + timeClient.getFormattedTime() + "<p>";
+  response += "Uptime: " + getUpTime() + "<p>";
   response += getTempReport() + "<p>";
   
-  int startAt = current_hour + 1;
-  if(startAt > 23) startAt = 0;
-  response += getAveragesReport(current_hour + 1, true);
-  response += "</code><p>";
+  int startAt = current_sample + 1;
+  if(startAt >= NUM_SAMPLES) startAt = 0;
+  response += getChart(startAt);
+  response += "<p>";
   response += prepareSetPointForm() + "<p>";
-  response += prepareResetTempForm();
-  response += INDEX_FOOTER;
+  response += prepareControlButtonsForm();
+  response += FPSTR(INDEX_FOOTER);
   server.send(200, "text/html", response);   // Send HTTP status 200 (Ok) and send some text to the browser/client
+}
+
+void redirectBackToRoot() {
+  // An attempt to clear form data, so that page refreshes don't re-submit
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+void handleResetAll() {
+  initSampleRecords();
+  writeDataToFS();
 }
 
 void handleSetPoints() {
@@ -352,7 +547,28 @@ void handleSetPoints() {
   if(minsetvalue < maxsetvalue) {
     relay_on_below_temp = fminsetvalue;
     relay_off_above_temp = fmaxsetvalue;
+
+    // Store the new values (along with everything else)
+    writeDataToFS();  // Probably should be moved to config, but was in the first file
   }
+}
+
+void handleJson() {
+  String jsonData = "{\n";
+  jsonData += "\"current\": \"" + String(current_temp, 1) + "\",\n";
+  jsonData += "\"minimum\": \"" + String(min_temp, 1) + "\",\n";
+  jsonData += "\"maximum\": \"" + String(max_temp, 1) + "\",\n";  
+  jsonData += "\"samples\": [";
+  for(int sample = 0; sample < NUM_SAMPLES; sample++)
+  {
+    if(sample > 0)
+      jsonData += ",";
+    jsonData += "\"" + String(sample_average_temps[sample], 1) + "\"";
+  }
+  jsonData += "]\n";
+  jsonData += "}";
+  
+  server.send(200, "application/json", jsonData);
 }
 
 void handleNotFound() {
