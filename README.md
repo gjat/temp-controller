@@ -7,7 +7,7 @@ The temperatures are charted as half hourly averages, and then current, minimum 
 
 To deal with resets and reprogramming, the configuration and the last 24 hour chart values are stored in flash memory.  So nothing is lost by unplugging and moving equipment around.
 
-![screenshot](./pics/brewmonitor%20screenshot.jpg)
+<img src="./pics/brewmonitor%20screenshot.jpg" width=250>
 
 ## Notes for programming / hardware
 
