@@ -1,10 +1,10 @@
 # ESP_8266 Beer Brew Temperature Controller
 
 This is a personal project that I made to help me brew beer.   It could easily be used for any other simple temperature monitoring and control purposes. 
-My beer ferments in an old fridge, which I use to keep the temperature consistent.  However, in winter, the brew can get too cold, and this device helps me keep an eye on the temperature, and allows me to control how cold it can get.
+I ferment my beer in an old fridge, which helps keep the temperature consistent.  However, in winter, the brew can get too cold.
 
-It uses An ESP8266 (AI-THINKER) module to monitor and chart temperature over time, accessible via a web interface.
-The software controls a heater, switching it on when the temperature falls below a configurable set point, and turning the heater off when the temperature goes above another.
+The Brew Controller uses An ESP8266 (AI-THINKER) module to monitor and chart temperature over time, accessible via a web interface.
+The Brew Controller can also control a heater, switching it on when the temperature falls below a configurable set point, and turning the heater off when the temperature goes above another.
 
 The temperature sensor is a DS1621 I2C chip (8 pin DIP), which measures temperature in 0.5°C steps.  This seems to be accurate enough, considering temperature differences that can happen within the enclosed environment. 
 
@@ -25,8 +25,8 @@ A root certificate can also be loaded to verify the server when connecting.  Ins
 **Yet to do:**
 
 - Split this README into multiple pages.
-- The temperature being pushed to the web service is the current reading of a new interval, which isn't making use of the average readings from the previous interval. I'll fix this up soon, but wanted to get basic end-to-end communication going first.
-- I'll add logging into a circular buffer, so the results of posting are easier to see and diagnose.
+- The readings sent to the web service are the current reading of a new sampling interval, which isn't making use of the average readings from the previous interval. I'll fix this up soon, but wanted to get basic end-to-end communication going first.
+- I'll add an in-memory log with a circular buffer, so the results of posting are easier to see and diagnose.
 - AWS Lambda cold-starts for .Net are a bit of a problem, with AWS taking around 8 seconds to start up the Lambda and respond.  Either I sort out Native AoT or SnapStarts, or re-implement the lambda in a language that doesn't suffer from the cold-start issue.
 - I'll host a page that pulls the current readings from AWS and charts them.   For now, I'm just viewing the raw JSON [here](https://lakptuva0h.execute-api.ap-southeast-2.amazonaws.com/Prod/).
 
@@ -36,7 +36,7 @@ A root certificate can also be loaded to verify the server when connecting.  Ins
 
 ### Programmer board.
 - I used the "getting started" information [here](https://tttapa.github.io/ESP8266/Chap01%20-%20ESP8266.html) as a basis for initial programming.
-- Programming the module using only power from the USB to TTL adapter may work initially,  But, the module needs more power (external supply) once it tries to connect to the WiFi.  So an external power source is eventually required.
+- It may be possible to initially program the module only using power from a USB to TTL adapter. But, the module needs more power (external supply) once it connects to WiFi.  So an external power source is eventually required.
 - I've used a LD1117 3.3v regulator to supply power to the ESP8266, regulating down from a 5v source.  In my case, it was a repurposed old tablet USB power adapter.
 - When connecting the USB/TTL to programmer board, a "cross over" connection is needed.  i.e. Rx to Tx, Tx to Rx.
 - To boot into "programming mode", hold down the reset and programming push buttons, then release the reset button first.  After this, you can take your hand away, and the device will be ready to accept new code from the Arduino IDE.
